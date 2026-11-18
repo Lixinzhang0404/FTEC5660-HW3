@@ -204,20 +204,20 @@ names and wording, and scores your 3 points only.
 ### Design
 
 ```mermaid
-flowchart TD
-    A["analyze_companies(agent, companies)<br/>20 companies in parallel, asyncio.gather + Semaphore(5)"] --> B["Per company: the four tools"]
-    B --> C{"Route each point to its evidence source"}
-    C -->|"Point 5"| D["sql_query: FY2025 revenue,<br/>COGS + SGA + R&amp;D, industry median"]
-    D --> D1["Python: margin >= median ?"]
-    C -->|"Point 7"| E["create_agent + interview tool<br/>current_employee -> fallback former_employee"]
-    E --> E1["LLM: positive / negative ?"]
-    C -->|"Point 10"| F["list_documents -> read the 4 earnings calls<br/>sql_query: revenue by quarter"]
-    F --> F1["LLM: extract the revenue quoted in each call"]
-    F1 --> F2["Python: any quarter deviates more than 2% ?"]
-    D1 --> G["Verdicts 5 / 7 / 10 + evidence strings"]
-    E1 --> G
+flowchart TB
+    A["analyze_companies(agent, companies)"]
+    A --> B["four tools per company"]
+    B --> R["route each point to its evidence source"]
+    R --> D1["Point 5 - database: sql_query for FY2025 revenue, cost of sales, selling and admin, R&D, plus the industry median"]
+    R --> E1["Point 7 - interviews: create_agent given the interview tool only"]
+    R --> F1["Point 10 - documents vs database: read the 4 earnings calls and sql_query by quarter"]
+    D1 --> D2["Python decides: margin vs industry median"]
+    E1 --> E2["LLM decides: positive or negative account"]
+    F1 --> F2["LLM extracts the quoted revenue; Python checks the 2% tolerance"]
+    D2 --> G["verdicts 5 / 7 / 10 plus evidence strings"]
+    E2 --> G
     F2 --> G
-    G --> H["One LLM call writes the 2-3 sentence summary<br/>verdicts are passed in as final, not recomputed"]
+    G --> H["one LLM call writes the 2-3 sentence summary; verdicts are final inputs"]
     H --> I["results.csv"]
 ```
 
