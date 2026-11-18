@@ -176,17 +176,24 @@ def _extract_json(text: str) -> dict:
 
 
 def _norm_quarter(s: Any) -> str | None:
-    """'2025Q3', '2025 Q3', 'Q3 2025', 'third quarter 2025' -> '2025Q3'."""
+    """Normalise any quarter spelling to 'YYYYQn'.
+
+    Accepts '2025Q3', '2025 Q3', '2025-Q3', 'Q3 2025', '3Q2025' and
+    'third quarter 2025'. Returning None here would silently drop a quarter
+    from the point-10 comparison, so the pattern is deliberately generous.
+    """
     t = str(s or "").lower()
     for word, num in _QUARTER_WORDS.items():
         t = t.replace(word, num)
-    m = re.search(r"(20\d{2})\s*[-/ ]?\s*q?\s*([1-4])", t) or \
-        re.search(r"q\s*([1-4])\s*[-/ ]?\s*(20\d{2})", t)
-    if not m:
-        return None
-    if len(m.group(1)) == 4:
+    # year first: 2025Q3, 2025 Q3, 2025-Q3
+    m = re.search(r"(20\d{2})\s*[-/ ]?\s*(?:q\s*)?([1-4])(?![0-9])", t)
+    if m:
         return f"{m.group(1)}Q{m.group(2)}"
-    return f"{m.group(2)}Q{m.group(1)}"
+    # quarter first: Q3 2025, 3Q2025, 3 quarter 2025
+    m = re.search(r"(?:q\s*)?([1-4])\s*(?:q\s*)?(?:quarter\s*)?[-/ ]?\s*(20\d{2})", t)
+    if m:
+        return f"{m.group(2)}Q{m.group(1)}"
+    return None
 
 
 def _eval_point5(sql_query: Any) -> tuple[str | None, str]:
