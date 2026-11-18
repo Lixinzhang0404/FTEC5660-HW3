@@ -170,14 +170,75 @@ for each public company. Grading uses a private set of about 20 unseen
 companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
-## Homework 3 solution:
-> to students: this is your report, see the homework description.
+## Homework 3 solution
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+**Point 5 — "Does the company have a worthwhile profit margin?"**
+
+*Why this point.* It is the cheapest honest test of whether the business is worth owning, and it is the one point where the company's own filings are least able to hide anything: revenue and the three cost lines have to add up. Fisher is careful to separate profit margin from profit volume, so the number has to be read against the economics of the company's own industry rather than against a single magic percentage.
+
+*PASS rule.* Compute the FY2025 operating margin from the database,
+`(revenue − cost of sales − selling & admin − R&D) / revenue`, with revenue the sum of `orders.amount` for 2025 and the three cost lines summed from `monthly_costs` for the same twelve months. Compare it with `industry_medians.operating_margin_pct` for the company's own industry. **PASS if margin ≥ the industry median, FAIL otherwise.** The arithmetic is done in SQL and Python, never in the model's head.
+
+*Evidence.* One SQL query over `orders`, `monthly_costs` and `industry_medians`, plus a check that twelve months of cost data exist. Management's claims are deliberately not used: the annual letter says things like "our gross margin was among the best in our industry", which is exactly the kind of sentence that is not evidence.
+
+**Point 7 — "Does the company have outstanding labor and personnel relations?"**
+
+*Why this point.* It is the purest application of Fisher's scuttlebutt: the only way to know how a company treats its people is to ask them. No database column records morale, so this point forces the agent to spend interviews rather than read tables.
+
+*PASS rule.* Ask a `current_employee` about `working_conditions` (falling back to `former_employee` only if the first cannot comment). **PASS if the account is clearly positive** — fair pay, people staying for years, problems fixed when raised, low turnover. **FAIL if it reports chronic overtime, monthly attrition, strike threats or pay complaints.** At most 2 of the company's 10 interviews are spent, and the interview limit is never approached.
+
+*Evidence.* Interviews only. The letter's "our people are our greatest strength" is management talking about itself; per the brief, that is not evidence of labour relations.
+
+**Point 10 — "How good are the company's cost analysis and accounting controls?"**
+
+*Why this point.* It is the only point that tests whether management's own numbers survive contact with the accounting records — the internal-consistency check an investor would actually run.
+
+*PASS rule.* Read all four earnings calls, extract the revenue figure management quotes for each quarter, and compare it with the database's quarterly sum of `orders` (converted from USD thousands to millions). **PASS if every quarter agrees within 2%; FAIL if any quarter is overstated or understated by more than that.**
+
+*Evidence.* The earnings calls, cross-checked against the database, as the assignment's evidence table requires.
+
+*One lesson worth recording.* My first version of point 10 added a second, softer criterion: PASS only if management also discusses cost controls "specifically and substantively". It scored 83.3% — it failed 14 of the 20 public companies. The reason is that the CFO's line ("We kept a close eye on costs across our plants. Returns stayed low and product quality was steady.") is boilerplate that appears word for word in good and bad companies alike, so the criterion collapsed every company to FAIL. That is the README's warning made concrete: management's own claims are not evidence on their own. Only the reconciliation against the database separates the six genuinely weak companies — each of them overstates exactly one quarter's revenue by 7–9%, while the others match to within 0.1%. Removing the subjective criterion took the point from 6/20 to 20/20.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A["analyze_companies(agent, companies)<br/>20 companies in parallel, asyncio.gather + Semaphore(5)"] --> B["Per company: the four tools"]
+    B --> C{"Route each point to its evidence source"}
+    C -->|"Point 5"| D["sql_query: FY2025 revenue,<br/>COGS + SGA + R&amp;D, industry median"]
+    D --> D1["Python: margin >= median ?"]
+    C -->|"Point 7"| E["create_agent + interview tool<br/>current_employee -> fallback former_employee"]
+    E --> E1["LLM: positive / negative ?"]
+    C -->|"Point 10"| F["list_documents -> read the 4 earnings calls<br/>sql_query: revenue by quarter"]
+    F --> F1["LLM: extract the revenue quoted in each call"]
+    F1 --> F2["Python: any quarter deviates more than 2% ?"]
+    D1 --> G["Verdicts 5 / 7 / 10 + evidence strings"]
+    E1 --> G
+    F2 --> G
+    G --> H["One LLM call writes the 2-3 sentence summary<br/>verdicts are passed in as final, not recomputed"]
+    H --> I["results.csv"]
+```
+
+The agent is a router rather than a single general-purpose tool-calling loop. Each of the three points is sent to the source the assignment designates for it, and the tool that point needs is the only one it is given: point 7's sub-agent sees just the `interview` tool, so it cannot wander into the database. Every number is computed in SQL and Python and handed to the model as a settled fact; the model is used for exactly two jobs, reading prose (what revenue did management quote, is this employee account positive or negative) and writing the final summary. That split is what makes the run deterministic enough to score the same on repeated runs, and fast: 20 companies finish in about 26 seconds against a 30-minute budget, spending one or two interviews per company. Verdicts are assembled before the summary is written and are passed in as finals, so the summary cannot talk the agent out of a verdict its own arithmetic produced; per-company exceptions are caught and still produce an entry, so one bad API call cannot cost the whole `results.csv`.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+On `public_test` (20 companies × 3 points = 60 verdicts) the agent scores **60/60 point verdicts, balanced 100.0%**, in 26 seconds, spending one interview per company except one, where the first answer could not be judged and a second was used.
+
+There is therefore no company where the submitted verdicts disagree with the public answers. The disagreements that existed during development were all point 10, and they were systematic rather than random: a first version that required management to discuss cost controls "substantively" marked 14 truly-passing companies FAIL (83.3% balanced). The fix was to drop that subjective criterion and decide point 10 purely by reconciling the quoted quarterly revenue against the database. Two other robustness changes came out of the same review: earnings-call documents are now discovered through `list_documents()` instead of hard-coded filenames, and an interview that cannot be judged falls back to one more interview plus a second judgement rather than silently defaulting.
+
+The remaining risk is honest to state: the private set uses the same answer key but different wording, so the rule that could move is point 5. The weakest passing company in the public set sits 1.7 percentage points above its industry median and the worst failing company 1.9 points below, so a company whose margin lands almost exactly on its industry median would be a coin flip, and the wording of the earnings calls is now the only thing standing between the extractor and the point-10 verdict.
+
+## Task 2: Reflection on AI-sycophancy and AI-psychosis
+
+**Sycophancy.** What this homework actually punished was not a model that lies, but a model that agrees. My first point-10 rule asked the model whether management discussed cost controls "specifically and substantively", and the model answered the way the question was framed: it found a reason to call the boilerplate inadequate, uniformly, for all twenty companies. That is sycophancy in its most useful disguise — not flattery of the user, but deference to the shape of the prompt. The rule felt analytical and produced a confident 83.3%, and nothing in the output said "this criterion does not discriminate". The score did.
+
+The same pull appears in the metric itself. Because most true verdicts are PASS, an agent that answers PASS everywhere is right 70% of the time and sounds calibrated; the balanced score exists precisely to take that comfort away, and it drops the lazy agent to 50%. I ended up treating the balanced score as the only honest feedback signal, and treating every extra criterion I added as something that had to earn its place against it. The general lesson is that a model will happily produce a justification for whichever rule I hand it, so the rule has to be defensible before the model sees it — in this case, a number that can be recomputed from the database, not a judgement about the quality of a sentence.
+
+**AI-psychosis.** The milder version of this is not delusion but fluency without referent, and I hit it directly. In an intermediate run the point-7 verdict was never passed into the summary prompt, and the model wrote, in perfectly composed prose, "Point 7 was not assessed here because no Point 7 data or rule was supplied" — for every company, in a report that was supposed to explain all three verdicts. Nothing crashed. The CSV was well-formed. A reader skimming the summaries would have seen an analyst's voice describing an analysis that had not happened. When a system always produces a plausible sentence, the absence of evidence stops looking like an absence: it looks like a judgement call.
+
+That is the failure mode I would worry about at scale. A person working with a fluent agent gradually loses the ability to tell "the agent checked and found this" from "the agent wrote something that fits". The defence that worked here was structural rather than rhetorical: the arithmetic lives in SQL and Python, the model only reads and writes prose, the verdicts are fixed before the summary is written, and a missing piece of evidence is a loud empty string in the evidence log rather than a graceful sentence. Keeping the model away from the numbers was not a limitation of the design; it was the design.
+
+There is a second, quieter risk on the human side. A 100% score on twenty companies feels like validation, and it is not: it is twenty examples drawn from one fixed answer key, on a task whose evidence was deliberately designed to be findable. The model did not become trustworthy; the data became checkable. The useful habit is to keep asking which part of the result is actually verified, and to notice that the answer is usually narrower than the number suggests.

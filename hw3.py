@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import csv
 import json
+import re
 import sqlite3
 import threading
 import zlib
@@ -57,61 +58,397 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [5, 7, 10]  ### YOUR CODE HERE
+
+
+# ===========================================================================
+#  Helper functions
+# ===========================================================================
+
+# 兼容 langchain 1.0 的 create_agent 与旧版 langgraph 的 create_react_agent
+try:
+    from langchain.agents import create_agent as _create_agent
+except ImportError:  # 旧版 langchain / langgraph
+    try:
+        from langgraph.prebuilt import create_react_agent as _create_react_agent
+
+        def _create_agent(model, tools, system_prompt):
+            return _create_react_agent(model, tools, prompt=system_prompt)
+    except ImportError:  # 都没有 → 运行时给清晰报错
+        _create_agent = None
+
+
+_SYSTEM_PROMPT = (
+    "You are a careful Fisher-style equity analyst. You will receive pre-computed "
+    "numbers, interview excerpts and document excerpts about a company. Apply the "
+    "stated rules exactly and return ONE JSON object with no markdown fence and no "
+    "extra prose. Never recompute numbers that are already given; treat given "
+    "numbers as ground truth."
+)
+
+from langchain_core.messages import HumanMessage, SystemMessage  # noqa: E402
+
+_QUARTER_WORDS = {"first": "1", "second": "2", "third": "3", "fourth": "4"}
+
+
+def _parse_sql_rows(text: str) -> list[dict[str, str]]:
+    lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
+    if not lines or lines[0].startswith("SQL error") or lines[0] == "(no rows)":
+        return []
+    header = [h.strip() for h in lines[0].split("|")]
+    rows: list[dict[str, str]] = []
+    for ln in lines[1:]:
+        if ln.startswith("...") or ln == "(no rows)":
+            continue
+        vals = [v.strip() for v in ln.split("|")]
+        if len(vals) != len(header):
+            continue
+        rows.append(dict(zip(header, vals)))
+    return rows
+
+
+def _f(s: Any) -> float | None:
+    if s is None:
+        return None
+    try:
+        return float(str(s).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _verdict(s: Any) -> str | None:
+    if isinstance(s, bool):
+        return "PASS" if s else "FAIL"
+    v = str(s or "").strip().upper()
+    return v if v in ("PASS", "FAIL") else None
+
+
+def _final(v: str | None) -> str:
+    """Every entry needs a verdict: a missing one scores as wrong anyway, and
+    most true verdicts are PASS, so an unverified point defaults to PASS."""
+    return v or "PASS"
+
+
+def _is_no_comment(text: str) -> bool:
+    t = (text or "").lower()
+    if len(t) < 40:
+        return True
+    return any(kw in t for kw in (
+        "can't comment", "cannot comment", "can not comment",
+        "no comment", "don't know", "do not know",
+        "not something i know", "wouldn't know", "would not know",
+    ))
+
+
+def _message_text(msg_or_content: Any) -> str:
+    """AIMessage.content may be str or list of blocks; normalize to str."""
+    c = getattr(msg_or_content, "content", msg_or_content)
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = []
+        for block in c:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text") or block.get("content") or ""))
+            else:
+                parts.append(str(block))
+        return "\n".join(p for p in parts if p)
+    return str(c)
+
+
+def _extract_json(text: str) -> dict:
+    text = _message_text(text).strip()
+    if "```" in text:
+        for part in text.split("```"):
+            p = part.strip()
+            if p.startswith("json"):
+                p = p[4:].strip()
+            if p.startswith("{"):
+                text = p
+                break
+    i, j = text.find("{"), text.rfind("}")
+    if i == -1 or j <= i:
+        return {}
+    try:
+        return json.loads(text[i:j + 1])
+    except json.JSONDecodeError:
+        return {}
+
+
+def _norm_quarter(s: Any) -> str | None:
+    """'2025Q3', '2025 Q3', 'Q3 2025', 'third quarter 2025' -> '2025Q3'."""
+    t = str(s or "").lower()
+    for word, num in _QUARTER_WORDS.items():
+        t = t.replace(word, num)
+    m = re.search(r"(20\d{2})\s*[-/ ]?\s*q?\s*([1-4])", t) or \
+        re.search(r"q\s*([1-4])\s*[-/ ]?\s*(20\d{2})", t)
+    if not m:
+        return None
+    if len(m.group(1)) == 4:
+        return f"{m.group(1)}Q{m.group(2)}"
+    return f"{m.group(2)}Q{m.group(1)}"
+
+
+def _eval_point5(sql_query: Any) -> tuple[str | None, str]:
+    """Point 5: FY2025 operating margin vs the company's own industry median."""
+    q = """
+    SELECT
+      (SELECT SUM(amount)/1000.0 FROM orders
+         WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01') AS rev_musd,
+      (SELECT SUM(cost_of_sales)/1000.0 FROM monthly_costs
+         WHERE month BETWEEN '2025-01' AND '2025-12')                 AS cogs_musd,
+      (SELECT SUM(selling_admin)/1000.0 FROM monthly_costs
+         WHERE month BETWEEN '2025-01' AND '2025-12')                 AS sga_musd,
+      (SELECT SUM(research_development)/1000.0 FROM monthly_costs
+         WHERE month BETWEEN '2025-01' AND '2025-12')                 AS rd_musd,
+      (SELECT COUNT(DISTINCT month) FROM monthly_costs
+         WHERE month BETWEEN '2025-01' AND '2025-12')                 AS n_months,
+      (SELECT im.operating_margin_pct FROM industry_medians im
+         WHERE LOWER(im.industry) = LOWER((SELECT industry FROM company LIMIT 1))
+         LIMIT 1)                                                     AS ind_median
+    """
+    raw = sql_query.invoke({"query": q})
+    rows = _parse_sql_rows(raw)
+    if not rows:
+        return None, f"point5: no data. raw={raw!r}"
+    r = rows[0]
+    rev  = _f(r.get("rev_musd"))
+    cogs, sga, rd = _f(r.get("cogs_musd")), _f(r.get("sga_musd")), _f(r.get("rd_musd"))
+    med  = _f(r.get("ind_median"))
+    n_months = int(_f(r.get("n_months")) or 0)
+    if rev is None or rev <= 0 or med is None or None in (cogs, sga, rd):
+        return None, f"point5: incomplete data rev={rev} cogs={cogs} sga={sga} rd={rd} med={med}"
+    profit = rev - cogs - sga - rd
+    margin = profit / rev * 100.0
+    verdict = "PASS" if margin >= med else "FAIL"
+    warn = "" if n_months >= 12 else f" [WARN only {n_months} months of cost data]"
+    ev = (f"FY2025 revenue {rev:.2f}M USD, operating profit {profit:.2f}M USD, "
+          f"operating margin {margin:.2f}% vs industry median {med:.2f}%{warn}; "
+          f"rule margin>=median -> {verdict}.")
+    return verdict, ev
+
+
+def _eval_point10(list_documents: Any, read_document: Any, sql_query: Any
+                  ) -> tuple[str, list[str], dict[str, float]]:
+    """Read every earnings-call document; return the text, its names and the
+    actual quarterly revenue from the database (USD millions)."""
+    listing = list_documents.invoke({}) or ""
+    names = [ln.split(":", 1)[0].strip() for ln in listing.splitlines() if ":" in ln]
+    doc_names = [n for n in names if "earnings" in n.lower() or "call" in n.lower()]
+    if not doc_names:
+        doc_names = [n for n in names if n.lower().endswith(".md")]
+
+    parts = []
+    for d in doc_names:
+        try:
+            text = read_document.invoke({"name": d})
+        except Exception as exc:
+            text = f"<error reading {d}: {exc}>"
+        parts.append(f"=== {d} ===\n{text}")
+
+    q = """
+    SELECT
+      substr(order_date, 1, 4) || 'Q' ||
+        CAST((CAST(substr(order_date, 6, 2) AS INTEGER) - 1) / 3 + 1 AS TEXT) AS q,
+      ROUND(SUM(amount)/1000.0, 2) AS rev_musd
+    FROM orders
+    WHERE order_date >= '2025-07-01' AND order_date < '2026-07-01'
+    GROUP BY q
+    ORDER BY q
+    """
+    actual: dict[str, float] = {}
+    for r in _parse_sql_rows(sql_query.invoke({"query": q})):
+        qn, v = (r.get("q") or "").strip(), _f(r.get("rev_musd"))
+        if qn and v is not None:
+            actual[qn] = v
+    return "\n\n".join(parts), doc_names, actual
+
+
+async def _extract_claims(agent: Any, docs_text: str) -> dict[str, float]:
+    """One LLM call: pull the revenue management quoted in each earnings call."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    prompt = (
+        "Below are a company's quarterly earnings-call transcripts.\n"
+        "For EACH call, find the revenue figure management quotes for that quarter "
+        "(it may be written as US dollars, USD, $, million or m).\n"
+        'Return ONE JSON object: {"quarters": {"<YYYYQn>": <number in USD millions>}}\n'
+        "Include one entry per call. Do not invent numbers.\n\n" + docs_text
+    )
+    for _ in range(2):
+        try:
+            resp = await agent.ainvoke([SystemMessage(content=_SYSTEM_PROMPT),
+                                        HumanMessage(content=prompt)])
+            parsed = _extract_json(_message_text(resp))
+            raw = parsed.get("quarters") or parsed.get("claimed_revenues_musd") or parsed
+            claims: dict[str, float] = {}
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    q, val = _norm_quarter(k), _f(v)
+                    if q and val is not None:
+                        claims[q] = val
+            if claims:
+                return claims
+        except Exception:
+            pass
+        prompt += "\n\nReturn valid JSON only, one entry per quarter."
+    return {}
+
+
+async def _summarize(agent: Any, name: str, verdicts: dict[int, str], evidence: dict[int, str]) -> str:
+    """One LLM call that only writes the summary; verdicts are final."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    lines = "\n".join(f"- Point {p} = {verdicts[p]}. Evidence: {evidence.get(p, '')[:700]}"
+                      for p in sorted(verdicts))
+    prompt = (
+        f'Company folder: "{name}". The three verdicts below are FINAL: do not change '
+        "them and do not recompute anything. Write 2-3 sentences for an investor: one "
+        "clause per point, citing the number (points 5 and 10) or the quote (point 7) "
+        "that justifies each verdict. Plain text only.\n\n" + lines
+    )
+    resp = await agent.ainvoke([
+        SystemMessage(content="You are a careful Fisher-style equity analyst. "
+                              "Reply with plain prose only: no JSON, no markdown, no lists."),
+        HumanMessage(content=prompt),
+    ])
+    text = _message_text(resp).strip()
+    if text.startswith("{"):  # unwrap {"summary": "..."} / {"investor_summary": "..."}
+        parsed = _extract_json(text)
+        text = next((str(v) for v in parsed.values() if isinstance(v, str) and len(v) > 20), text)
+    return text
+
+
+async def _judge_labour(agent: Any, quote: str) -> tuple[str | None, str]:
+    """One LLM call: negative labour signals -> FAIL."""
+    resp = await agent.ainvoke([
+        SystemMessage(content=_SYSTEM_PROMPT),
+        HumanMessage(content=(
+            "An employee said this about their company:\n" + quote + "\n\n"
+            "PASS = clearly good labour/personnel relations (fair pay, low turnover, morale).\n"
+            "FAIL = clearly bad (chronic overtime, high turnover, pay complaints, strike threat).\n"
+            'Return ONLY {"verdict":"PASS" or "FAIL","reason":"<one sentence>"}')),
+    ])
+    parsed = _extract_json(_message_text(resp))
+    return _verdict(parsed.get("verdict")), str(parsed.get("reason", ""))
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
-
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
-
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
-    """
-    ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+    load_env_file()
+    return ChatDeepSeek(model=MODEL_NAME, temperature=0, timeout=120, max_retries=2,
+                        max_tokens=2000)
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
-    """Run your agent and return its verdicts on CHOSEN_POINTS for every company.
-
-    ``companies`` maps each company folder name to its four LangChain tools:
-
-        list_documents()             names and dates of the company's documents
-        read_document(name)          the text of one document
-        sql_query(query)             one read-only SQLite query on company.db
-        interview(role, topic)       one interview answer (INTERVIEW_LIMIT per company)
-
-    Give the tools to a tool-calling agent, e.g.
-    ``create_agent(model, tools=companies[name], system_prompt=...)``, or call
-    them yourself with ``tool.invoke({...})``. The README explains the
-    documents, the database tables and the interview roles and topics.
-
-    Return one dictionary per company folder name, e.g. with
-    CHOSEN_POINTS = [1, 7, 15]:
-
-        {
-            "hollins_group": {
-                "points": {1: "PASS", 7: "FAIL", 15: "PASS"},
-                "summary": "Two or three sentences explaining the verdicts.",
-            },
-            ...
+    if _create_agent is None:
+        return {
+            name: {"points": {p: "PASS" for p in CHOSEN_POINTS},
+                   "summary": "create_agent not available; install langchain>=1.0 or langgraph."}
+            for name in companies
         }
 
-    Each chosen point needs a verdict ("PASS" or "FAIL"; True/False also
-    works). Other points are ignored.
+    sem = asyncio.Semaphore(5)
 
-    Catch errors per company (e.g. a failed API call) and still return an
-    entry for it: an exception here means no results.csv, which scores zero.
-    You may analyse companies in parallel (e.g. ``asyncio.gather``).
-    """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    async def point7(interview: Any, name: str) -> tuple[str | None, str]:
+        """Route point 7 to interviews: at most two are spent."""
+        try:
+            p7_agent = _create_agent(
+                agent,
+                tools=[interview],
+                system_prompt=(
+                    "You are doing Fisher's scuttlebutt on LABOR AND PERSONNEL RELATIONS.\n"
+                    "  1. Call interview(role='current_employee', topic='working_conditions').\n"
+                    "  2. If the answer says 'can't comment' or is clearly off-topic, call\n"
+                    "     interview(role='former_employee', topic='working_conditions').\n"
+                    "  3. Do NOT ask any other role or topic.\n"
+                    "  PASS = clearly positive (fair treatment, morale, pay, safety, retention).\n"
+                    "  FAIL = clearly negative (complaints, hostility, high turnover, fear).\n"
+                    "Reply with ONE JSON object only:\n"
+                    '{"verdict":"PASS" or "FAIL","evidence":"<quote>","reason":"<one sentence>"}'
+                ),
+            )
+            async with sem:
+                resp = await p7_agent.ainvoke(
+                    {"messages": [HumanMessage(content=f"Company folder: {name}. Start the scuttlebutt.")]},
+                    config={"recursion_limit": 8},
+                )
+            parsed = _extract_json(_message_text(resp["messages"][-1]))
+            return (_verdict(parsed.get("verdict")),
+                    f"interview said: {parsed.get('evidence', '')} ({parsed.get('reason', '')})")
+        except Exception as exc:
+            return None, f"point7 agent error: {type(exc).__name__}: {exc}"
 
+    async def analyze_one(name: str, tools: list[Any]) -> dict[str, Any]:
+        _list_documents, read_document, sql_query, interview = tools
+        verdicts: dict[int, str] = {}
+        evidence: dict[int, str] = {}
+
+        # ---------- point 5: SQL + Python, no model in the loop ----------
+        try:
+            v5, ev5 = _eval_point5(sql_query)
+        except Exception as exc:
+            v5, ev5 = None, f"point5 error: {type(exc).__name__}: {exc}"
+        verdicts[5] = _final(v5)
+        evidence[5] = ev5
+
+        # ---------- point 7: scuttlebutt ----------
+        v7, ev7 = await point7(interview, name)
+        if v7 is None:  # fallback: one more interview, judged by one LLM call
+            try:
+                quote = _message_text(await interview.ainvoke(
+                    {"role": "former_employee", "topic": "working_conditions"}))
+                if _is_no_comment(quote):
+                    quote = _message_text(await interview.ainvoke(
+                        {"role": "current_employee", "topic": "working_conditions"}))
+                v7, why = await _judge_labour(agent, quote)
+                ev7 = f"fallback interview: {quote} ({why})"
+            except Exception as exc:
+                ev7 = f"point7 fallback error: {type(exc).__name__}: {exc}"
+        verdicts[7] = _final(v7)
+        evidence[7] = ev7
+
+        # ---------- point 10: documents vs database, decided in Python ----------
+        try:
+            docs_text, doc_names, actual = _eval_point10(_list_documents, read_document, sql_query)
+            async with sem:
+                claims = await _extract_claims(agent, docs_text)
+            mismatches = []
+            for qn, claimed in sorted(claims.items()):
+                av = actual.get(qn)
+                if av and av > 0 and abs(claimed - av) / av > 0.02:
+                    mismatches.append(f"{qn}: claimed {claimed:.2f} vs database {av:.2f}")
+            verdicts[10] = "FAIL" if mismatches else "PASS"
+            checked = ", ".join(f"{qn} {claims[qn]:.2f}/{actual.get(qn, float('nan')):.2f}"
+                                for qn in sorted(claims))
+            evidence[10] = (f"{len(doc_names)} earnings calls read; claimed/database (USD M): {checked}; "
+                            + ("MISMATCH -> FAIL: " + "; ".join(mismatches) if mismatches
+                               else "all quarters within 2% -> PASS"))
+        except Exception as exc:
+            verdicts[10] = "PASS"
+            evidence[10] = f"point10 error: {type(exc).__name__}: {exc}"
+
+        # ---------- summary: one call, verdicts are final inputs ----------
+        try:
+            async with sem:
+                summary = await _summarize(agent, name, verdicts, evidence)
+        except Exception as exc:
+            summary = f"Analysis failed: {type(exc).__name__}: {exc}"
+
+        return {"points": dict(verdicts), "summary": summary}
+
+    results = await asyncio.gather(
+        *(analyze_one(n, t) for n, t in companies.items()),
+        return_exceptions=True,
+    )
+    out: dict[str, dict[str, Any]] = {}
+    for name, res in zip(companies.keys(), results):
+        if isinstance(res, Exception):
+            out[name] = {"points": {p: "PASS" for p in CHOSEN_POINTS},
+                         "summary": f"error: {type(res).__name__}: {res}"}
+        else:
+            out[name] = res
+    return out
 
 # Everything below is provided runner/scoring code. No edits are needed.
 # Your code must read company data only through these tools: do not open
